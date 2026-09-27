@@ -12,7 +12,8 @@ func healthHandler(w http.ResponseWriter, r *http.Request) {
 	w.Write([]byte("OK"))
 }
 
-func streamHandler(w http.ResponseWriter, _ *http.Request) {
+func streamHandler(w http.ResponseWriter, r *http.Request) {
+	ctx := r.Context()
 	w.Header().Set("Content-Type", "text/event-stream")
 
 	flusher, ok := w.(http.Flusher)
@@ -22,10 +23,15 @@ func streamHandler(w http.ResponseWriter, _ *http.Request) {
 	}
 
 	for {
-		fmt.Fprintf(w, "data: your message here\n\n")
-		flusher.Flush()
 
-		time.Sleep(2 * time.Second)
+		select {
+		case <-ctx.Done():
+			fmt.Println("client disconnected")
+			return
+		case <-time.After(2 * time.Second):
+			w.Write([]byte("data: your message here\n\n"))
+			flusher.Flush()
+		}
 	}
 }
 
