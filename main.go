@@ -1,6 +1,7 @@
 package main
 
 import (
+	"encoding/json"
 	"fmt"
 	"net/http"
 	"time"
@@ -39,10 +40,37 @@ func streamHandler(broker *Broker, w http.ResponseWriter, r *http.Request) {
 	}
 }
 
-func testBroadcastHandler(broker *Broker, w http.ResponseWriter, r *http.Request) {
+func testBroadcastHandler(broker *Broker, w http.ResponseWriter) {
 	broker.Broadcast("message sent at " + time.Now().String())
 
 	fmt.Fprintf(w, "event sent")
+}
+
+func publishEventsHandler(broker *Broker, w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+
+	var event Event
+	err := json.NewDecoder(r.Body).Decode(&event)
+	if err != nil {
+		fmt.Print(err.Error())
+		http.Error(w, "invalid json", http.StatusBadRequest)
+		return
+	}
+
+	err = event.validate()
+	if err != nil {
+		fmt.Print(err.Error())
+		http.Error(w, "invalid json", http.StatusBadRequest)
+		return
+	}
+
+	broker.Broadcast(fmt.Sprintf("{type: %s, payload: %s}", event.Type, event.Payload))
+
+	w.Header().Set("Content-Type", "application/json")
+	json.NewEncoder(w).Encode(map[string]string{"status": "ok"})
 }
 
 func startServer() error {
@@ -54,7 +82,8 @@ func startServer() error {
 
 	http.HandleFunc("/health", healthHandler)
 	http.HandleFunc("/stream", func(w http.ResponseWriter, r *http.Request) { streamHandler(broker, w, r) })
-	http.HandleFunc("/test-broadcast", func(w http.ResponseWriter, r *http.Request) { testBroadcastHandler(broker, w, r) })
+	http.HandleFunc("/test-broadcast", func(w http.ResponseWriter, r *http.Request) { testBroadcastHandler(broker, w) })
+	http.HandleFunc("/events", func(w http.ResponseWriter, r *http.Request) { publishEventsHandler(broker, w, r) })
 
 	if err := http.ListenAndServe(":8080", nil); err != nil {
 		return err
