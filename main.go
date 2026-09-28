@@ -12,9 +12,12 @@ func healthHandler(w http.ResponseWriter, r *http.Request) {
 	w.Write([]byte("OK"))
 }
 
-func streamHandler(w http.ResponseWriter, r *http.Request) {
+func streamHandler(broker *Broker, w http.ResponseWriter, r *http.Request) {
 	ctx := r.Context()
 	w.Header().Set("Content-Type", "text/event-stream")
+
+	ch := make(chan string)
+	broker.Subscribe(ch)
 
 	flusher, ok := w.(http.Flusher)
 	if !ok {
@@ -27,19 +30,31 @@ func streamHandler(w http.ResponseWriter, r *http.Request) {
 		select {
 		case <-ctx.Done():
 			fmt.Println("client disconnected")
+			broker.Unsubscribe(ch)
 			return
-		case <-time.After(2 * time.Second):
-			w.Write([]byte("data: your message here\n\n"))
+		case msg := <-ch:
+			w.Write([]byte(fmt.Sprintf("data: %s\n\n", msg)))
 			flusher.Flush()
 		}
 	}
 }
 
+func testBroadcastHandler(broker *Broker, w http.ResponseWriter, r *http.Request) {
+	broker.Broadcast("message sent at " + time.Now().String())
+
+	fmt.Fprintf(w, "event sent")
+}
+
 func startServer() error {
 	fmt.Println("streamline server starting...")
 
+	broker := &Broker{
+		subscribers: make(map[chan string]bool),
+	}
+
 	http.HandleFunc("/health", healthHandler)
-	http.HandleFunc("/stream", streamHandler)
+	http.HandleFunc("/stream", func(w http.ResponseWriter, r *http.Request) { streamHandler(broker, w, r) })
+	http.HandleFunc("/test-broadcast", func(w http.ResponseWriter, r *http.Request) { testBroadcastHandler(broker, w, r) })
 
 	if err := http.ListenAndServe(":8080", nil); err != nil {
 		return err
