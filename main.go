@@ -1,10 +1,14 @@
 package main
 
 import (
+	"context"
 	"encoding/json"
+	"flag"
 	"fmt"
 	"net/http"
 	"time"
+
+	"github.com/redis/go-redis/v9"
 )
 
 func healthHandler(w http.ResponseWriter, r *http.Request) {
@@ -16,15 +20,19 @@ func healthHandler(w http.ResponseWriter, r *http.Request) {
 func streamHandler(broker *Broker, w http.ResponseWriter, r *http.Request) {
 	ctx := r.Context()
 	w.Header().Set("Content-Type", "text/event-stream")
-
-	ch := make(chan string)
-	broker.Subscribe(ch)
+	w.Header().Set("Cache-Control", "no-cache")
+	w.Header().Set("Connection", "keep-alive")
 
 	flusher, ok := w.(http.Flusher)
 	if !ok {
 		http.Error(w, "streaming not supported", http.StatusInternalServerError)
 		return
 	}
+
+	flusher.Flush()
+
+	ch := make(chan string)
+	broker.Subscribe(ch)
 
 	for {
 
@@ -46,7 +54,7 @@ func testBroadcastHandler(broker *Broker, w http.ResponseWriter) {
 	fmt.Fprintf(w, "event sent")
 }
 
-func publishEventsHandler(broker *Broker, w http.ResponseWriter, r *http.Request) {
+func publishEventsHandler(broker *Broker, redis *redis.Client, w http.ResponseWriter, r *http.Request) {
 	if r.Method != http.MethodPost {
 		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
 		return
@@ -67,33 +75,50 @@ func publishEventsHandler(broker *Broker, w http.ResponseWriter, r *http.Request
 		return
 	}
 
-	broker.Broadcast(fmt.Sprintf("{type: %s, payload: %s}", event.Type, event.Payload))
+	// broker.Broadcast(fmt.Sprintf("{type: %s, payload: %s}", event.Type, event.Payload))
+
+	ctx := r.Context()
+	err = publishEvent(ctx, redis, event.Topic, event)
+	if err != nil {
+		fmt.Println("failed to publish event:", err.Error())
+		http.Error(w, "failed to publish event", http.StatusInternalServerError)
+		return
+	}
 
 	w.Header().Set("Content-Type", "application/json")
 	json.NewEncoder(w).Encode(map[string]string{"status": "ok"})
 }
 
-func startServer() error {
-	fmt.Println("streamline server starting...")
+func startServer(port string) error {
+	fmt.Printf("streamline server starting on port %s...\n", port)
 
 	broker := &Broker{
 		subscribers: make(map[chan string]bool),
 	}
 
-	http.HandleFunc("/health", healthHandler)
-	http.HandleFunc("/stream", func(w http.ResponseWriter, r *http.Request) { streamHandler(broker, w, r) })
-	http.HandleFunc("/test-broadcast", func(w http.ResponseWriter, r *http.Request) { testBroadcastHandler(broker, w) })
-	http.HandleFunc("/events", func(w http.ResponseWriter, r *http.Request) { publishEventsHandler(broker, w, r) })
+	redisClient := NewRedisClient()
 
-	if err := http.ListenAndServe(":8080", nil); err != nil {
+	mux := http.NewServeMux()
+	mux.HandleFunc("/health", healthHandler)
+	mux.HandleFunc("/stream", func(w http.ResponseWriter, r *http.Request) { streamHandler(broker, w, r) })
+	mux.HandleFunc("/test-broadcast", func(w http.ResponseWriter, r *http.Request) { testBroadcastHandler(broker, w) })
+	mux.HandleFunc("/events", func(w http.ResponseWriter, r *http.Request) { publishEventsHandler(broker, redisClient, w, r) })
+
+	// Start the consumer
+	go startConsumer(context.Background(), redisClient, broker, "deployments")
+
+	if err := http.ListenAndServe(":"+port, mux); err != nil {
 		return err
 	}
 	return nil
 }
 
 func main() {
-	err := startServer()
+	port := flag.String("port", "8080", "port to listen on")
+	flag.Parse()
+
+	err := startServer(*port)
 	if err != nil {
-		fmt.Println("server failed to start", err.Error())
+		fmt.Println("server failed to start:", err.Error())
 	}
 }
