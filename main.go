@@ -6,7 +6,6 @@ import (
 	"flag"
 	"fmt"
 	"net/http"
-	"time"
 
 	"github.com/redis/go-redis/v9"
 )
@@ -17,11 +16,17 @@ func healthHandler(w http.ResponseWriter, r *http.Request) {
 	w.Write([]byte("OK"))
 }
 
-func streamHandler(broker *Broker, w http.ResponseWriter, r *http.Request) {
+func streamHandler(broker *Broker, redisClient *redis.Client, w http.ResponseWriter, r *http.Request) {
 	ctx := r.Context()
 	w.Header().Set("Content-Type", "text/event-stream")
 	w.Header().Set("Cache-Control", "no-cache")
 	w.Header().Set("Connection", "keep-alive")
+
+	topic := r.URL.Query().Get("topic")
+	if topic == "" {
+		http.Error(w, "topic is required", http.StatusBadRequest)
+		return
+	}
 
 	flusher, ok := w.(http.Flusher)
 	if !ok {
@@ -29,29 +34,28 @@ func streamHandler(broker *Broker, w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	w.WriteHeader(http.StatusOK)
 	flusher.Flush()
+
+	lastProcessedId := r.Header.Get("Last-Event-ID")
+	if lastProcessedId != "" {
+		replayEvents(ctx, redisClient, w, flusher, topic, lastProcessedId)
+	}
 
 	ch := make(chan string)
 	broker.Subscribe(ch)
 
 	for {
-
 		select {
 		case <-ctx.Done():
 			fmt.Println("client disconnected")
 			broker.Unsubscribe(ch)
 			return
 		case msg := <-ch:
-			w.Write([]byte(fmt.Sprintf("data: %s\n\n", msg)))
+			w.Write([]byte(msg))
 			flusher.Flush()
 		}
 	}
-}
-
-func testBroadcastHandler(broker *Broker, w http.ResponseWriter) {
-	broker.Broadcast("message sent at " + time.Now().String())
-
-	fmt.Fprintf(w, "event sent")
 }
 
 func publishEventsHandler(broker *Broker, redis *redis.Client, w http.ResponseWriter, r *http.Request) {
@@ -100,8 +104,7 @@ func startServer(port string) error {
 
 	mux := http.NewServeMux()
 	mux.HandleFunc("/health", healthHandler)
-	mux.HandleFunc("/stream", func(w http.ResponseWriter, r *http.Request) { streamHandler(broker, w, r) })
-	mux.HandleFunc("/test-broadcast", func(w http.ResponseWriter, r *http.Request) { testBroadcastHandler(broker, w) })
+	mux.HandleFunc("/stream", func(w http.ResponseWriter, r *http.Request) { streamHandler(broker, redisClient, w, r) })
 	mux.HandleFunc("/events", func(w http.ResponseWriter, r *http.Request) { publishEventsHandler(broker, redisClient, w, r) })
 
 	// Start the consumer

@@ -3,6 +3,7 @@ package main
 import (
 	"context"
 	"fmt"
+	"net/http"
 
 	"github.com/redis/go-redis/v9"
 )
@@ -40,11 +41,33 @@ func startConsumer(ctx context.Context, client *redis.Client, broker *Broker, to
 				eventType := message.Values["type"].(string)
 				payload := message.Values["payload"].(string)
 
-				broker.Broadcast(fmt.Sprintf("{type: %s, payload: %s}", eventType, payload))
+				msg := fmt.Sprintf("id: %s\ndata: {type: %s, payload: %s}\n\n", message.ID, eventType, payload)
+
+				broker.Broadcast(msg)
 
 				lastId = message.ID
 			}
 		}
+	}
+}
+
+func replayEvents(ctx context.Context, client *redis.Client, w http.ResponseWriter, flusher http.Flusher, topic, lastID string) error {
+	results, err := client.XRange(ctx, "events:"+topic, lastID, "+").Result()
+	if err != nil {
+		return err
+	}
+
+	for _, message := range results {
+		if message.ID == lastID {
+			continue
+		}
+
+		eventType := message.Values["type"].(string)
+		payload := message.Values["payload"].(string)
+		msg := fmt.Sprintf("id: %s\ndata: {type: %s, payload: %s}\n\n", message.ID, eventType, payload)
+
+		w.Write([]byte(msg))
+		flusher.Flush()
 	}
 
 	return nil

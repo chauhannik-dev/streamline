@@ -37,7 +37,7 @@ func TestStreamlineRedisFlow(t *testing.T) {
 	// Set up HTTP test server
 	mux := http.NewServeMux()
 	mux.HandleFunc("/stream", func(w http.ResponseWriter, r *http.Request) {
-		streamHandler(broker, w, r)
+		streamHandler(broker, redisClient, w, r)
 	})
 	mux.HandleFunc("/events", func(w http.ResponseWriter, r *http.Request) {
 		publishEventsHandler(broker, redisClient, w, r)
@@ -47,7 +47,7 @@ func TestStreamlineRedisFlow(t *testing.T) {
 	defer server.Close()
 
 	// 1. Subscribe to SSE endpoint
-	req, err := http.NewRequest("GET", server.URL+"/stream", nil)
+	req, err := http.NewRequest("GET", server.URL+"/stream?topic=deployments", nil)
 	if err != nil {
 		t.Fatalf("failed to create request: %v", err)
 	}
@@ -110,3 +110,84 @@ func TestStreamlineRedisFlow(t *testing.T) {
 		t.Fatal("timed out waiting for event on SSE stream")
 	}
 }
+
+func TestStreamlineEventReplay(t *testing.T) {
+	redisClient := NewRedisClient()
+	defer redisClient.Close()
+
+	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+	defer cancel()
+
+	if err := redisClient.Ping(ctx).Err(); err != nil {
+		t.Fatalf("Redis is not available: %v", err)
+	}
+
+	broker := &Broker{
+		subscribers: make(map[chan string]bool),
+	}
+
+	mux := http.NewServeMux()
+	mux.HandleFunc("/stream", func(w http.ResponseWriter, r *http.Request) {
+		streamHandler(broker, redisClient, w, r)
+	})
+	mux.HandleFunc("/events", func(w http.ResponseWriter, r *http.Request) {
+		publishEventsHandler(broker, redisClient, w, r)
+	})
+
+	server := httptest.NewServer(mux)
+	defer server.Close()
+
+	// 1. POST an event first (before any stream connection)
+	eventData := Event{
+		Topic:   "replay-test",
+		Type:    "REPLAY_EVENT",
+		Payload: "replayed payload",
+	}
+	body, _ := json.Marshal(eventData)
+
+	postResp, err := http.Post(server.URL+"/events", "application/json", bytes.NewBuffer(body))
+	if err != nil {
+		t.Fatalf("failed to post event: %v", err)
+	}
+	defer postResp.Body.Close()
+
+	// 2. Connect with Last-Event-ID: 0-0 header
+	req, err := http.NewRequest("GET", server.URL+"/stream?topic=replay-test", nil)
+	if err != nil {
+		t.Fatalf("failed to create request: %v", err)
+	}
+	req.Header.Set("Last-Event-ID", "0-0")
+
+	client := &http.Client{}
+	resp, err := client.Do(req)
+	if err != nil {
+		t.Fatalf("failed to connect to SSE stream: %v", err)
+	}
+	defer resp.Body.Close()
+
+	// Read replayed message
+	msgChan := make(chan string, 1)
+	go func() {
+		scanner := bufio.NewScanner(resp.Body)
+		for scanner.Scan() {
+			line := scanner.Text()
+			if strings.HasPrefix(line, "data: ") {
+				msgChan <- strings.TrimPrefix(line, "data: ")
+				return
+			}
+		}
+	}()
+
+	select {
+	case msg := <-msgChan:
+		expected := fmt.Sprintf("{type: %s, payload: %s}", eventData.Type, eventData.Payload)
+		if msg != expected {
+			t.Errorf("expected replayed msg %q, got %q", expected, msg)
+		} else {
+			t.Logf("Success! Replayed event received over SSE: %s", msg)
+		}
+	case <-time.After(3 * time.Second):
+		t.Fatal("timed out waiting for replayed event on SSE stream")
+	}
+}
+
